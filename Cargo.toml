@@ -1,0 +1,10 @@
+[package]
+name = "linlua"
+version = "0.1.0"
+edition = "2021"
+description = "A Luau-flavored Lua subset on the linjs engine architecture: gradual types, gradual linear memory (--@own), and a strict-dialect WASM backend."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/thyrgle/linlua"
+readme = "README.md"
+
+[dependencies]
