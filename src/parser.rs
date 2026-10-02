@@ -35,6 +35,30 @@ impl Parser {
     /// The annotation attached to the statement starting at
     /// `stmt_start`: a comment sitting between the previous token and
     /// the statement. One annotation applies to one statement.
+    /// A type annotation: builtin names, or `{T}` for arrays.
+    fn parse_type(&mut self) -> Result<TypeAnn, ParseError> {
+        if self.eat(&Tok::LBrace) {
+            let inner = self.parse_type()?;
+            self.expect(&Tok::RBrace)?;
+            return Ok(TypeAnn::Array(Box::new(inner)));
+        }
+        // `nil` is a keyword, not a name.
+        if self.eat(&Tok::Nil) {
+            return Ok(TypeAnn::Nil);
+        }
+        let name = self.expect_name()?;
+        match name.as_str() {
+            "nil" => Ok(TypeAnn::Nil),
+            "number" => Ok(TypeAnn::Number),
+            "string" => Ok(TypeAnn::String),
+            "boolean" => Ok(TypeAnn::Boolean),
+            "any" => Ok(TypeAnn::Any),
+            other => Err(self.err(&format!(
+                "unknown type `{other}` (v1 knows nil, number, string, boolean, any, {{T}})"
+            ))),
+        }
+    }
+
     fn pending_annotation(&self, stmt_start: usize) -> Option<Annotation> {
         let prev_end = if self.pos == 0 {
             0
@@ -172,17 +196,27 @@ impl Parser {
                 self.pos += 1;
                 if self.eat(&Tok::Function) {
                     let name = self.expect_name()?;
-                    let (params, body) = self.fn_parts()?;
+                    let (params, ret, body) = self.fn_parts()?;
                     return Ok(Stmt::Fn {
                         name,
                         params,
+                        ret,
                         body,
                         is_local: true,
                     });
                 }
-                let mut names = vec![self.expect_name()?];
-                while self.eat(&Tok::Comma) {
-                    names.push(self.expect_name()?);
+                let mut names = Vec::new();
+                loop {
+                    let name = self.expect_name()?;
+                    let ty = if self.eat(&Tok::Colon) {
+                        Some(self.parse_type()?)
+                    } else {
+                        None
+                    };
+                    names.push((name, ty));
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
                 }
                 let mut inits = Vec::new();
                 if self.eat(&Tok::Assign) {
@@ -262,7 +296,7 @@ impl Parser {
                 if self.at(&Tok::Colon) {
                     return Err(self.err("method syntax `obj:m()` is not in the v1 dialect"));
                 }
-                let (params, body) = self.fn_parts()?;
+                let (params, ret, body) = self.fn_parts()?;
                 if name.contains('.') {
                     return Err(self.err(
                         "dotted function names (`function t.f()`) are not in the v1 dialect",
@@ -271,6 +305,7 @@ impl Parser {
                 Ok(Stmt::Fn {
                     name,
                     params,
+                    ret,
                     body,
                     is_local: false,
                 })
@@ -352,7 +387,7 @@ impl Parser {
         }
     }
 
-    fn fn_parts(&mut self) -> Result<(Vec<String>, Vec<Stmt>), ParseError> {
+    fn fn_parts(&mut self) -> Result<FnParts, ParseError> {
         self.expect(&Tok::LParen)?;
         let mut params = Vec::new();
         if !self.at(&Tok::RParen) {
@@ -360,16 +395,27 @@ impl Parser {
                 if self.at(&Tok::DDot) {
                     return Err(self.err("varargs `...` are not in the v1 dialect"));
                 }
-                params.push(self.expect_name()?);
+                let name = self.expect_name()?;
+                let ty = if self.eat(&Tok::Colon) {
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                params.push((name, ty));
                 if !self.eat(&Tok::Comma) {
                     break;
                 }
             }
         }
         self.expect(&Tok::RParen)?;
+        let ret = if self.eat(&Tok::Colon) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
         let body = self.block()?;
         self.expect(&Tok::End)?;
-        Ok((params, body))
+        Ok((params, ret, body))
     }
 
     // ---- expressions ----
@@ -582,8 +628,8 @@ impl Parser {
             Tok::DDot => Ok(Expr::Vararg),
             Tok::Name(n) => Ok(Expr::Ident(n)),
             Tok::Function => {
-                let (params, body) = self.fn_parts()?;
-                Ok(Expr::Function { params, body })
+                let (params, ret, body) = self.fn_parts()?;
+                Ok(Expr::Function { params, ret, body })
             }
             Tok::LBrace => self.table_expr(),
             Tok::LParen => {
@@ -632,6 +678,10 @@ impl Parser {
         }
     }
 }
+
+/// The parts of a `function` header: typed params, optional return
+/// annotation, body.
+type FnParts = (Vec<(String, Option<TypeAnn>)>, Option<TypeAnn>, Vec<Stmt>);
 
 /// A parsed `name.k` chain (or bare name) becomes an assignment
 /// target.

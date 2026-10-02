@@ -127,14 +127,14 @@ impl<'o> Interp<'o> {
     fn exec_stmt(&mut self, stmt: &Stmt, env: &Rc<RefCell<Env>>) -> R<Flow> {
         match stmt {
             Stmt::Local { names, inits, ann } => {
-                // An annotation opts the single-name form into linear
-                // memory; multi-name declarations stay dynamic.
+                // The memory annotation opts the single-name form
+                // into linear memory; type annotations are erased.
                 if ann.is_some() && names.len() != 1 {
                     return Err(bail("annotate one name at a time"));
                 }
                 match ann {
                     Some(Annotation::Own) => {
-                        let name = &names[0];
+                        let name = &names[0].0;
                         let handle = self.alloc_own(&inits[0], env)?;
                         env.borrow_mut()
                             .vars
@@ -142,7 +142,7 @@ impl<'o> Interp<'o> {
                         return Ok(Flow::Normal);
                     }
                     Some(Annotation::Ref) => {
-                        let name = &names[0];
+                        let name = &names[0].0;
                         let v = self.eval(&inits[0], env)?;
                         env.borrow_mut()
                             .vars
@@ -163,7 +163,7 @@ impl<'o> Interp<'o> {
                     .map(|(i, v)| match (&v, inits.get(i)) {
                         (Value::Own(_), Some(Expr::Ident(src))) => {
                             let src = src.clone();
-                            if names.get(i).map(|n| n == &src) != Some(true) {
+                            if names.get(i).map(|(n, _)| n == &src) != Some(true) {
                                 env.borrow_mut().assign(&src, Value::Moved);
                             }
                             v
@@ -172,7 +172,7 @@ impl<'o> Interp<'o> {
                     })
                     .collect();
                 let mut scope = env.borrow_mut();
-                for (i, name) in names.iter().enumerate() {
+                for (i, (name, _)) in names.iter().enumerate() {
                     let v = values.get(i).cloned().unwrap_or(Value::Nil);
                     scope.vars.insert(name.clone(), v);
                 }
@@ -195,9 +195,10 @@ impl<'o> Interp<'o> {
                 params,
                 body,
                 is_local,
+                ..
             } => {
                 let f = Value::Func(Rc::new(Func {
-                    params: params.clone(),
+                    params: params.iter().map(|(n, _)| n.clone()).collect(),
                     body: Rc::new(body.clone()),
                     env: Rc::clone(env),
                 }));
@@ -542,8 +543,8 @@ impl<'o> Interp<'o> {
                 }
                 Ok(Value::Table(t))
             }
-            Expr::Function { params, body } => Ok(Value::Func(Rc::new(Func {
-                params: params.clone(),
+            Expr::Function { params, body, .. } => Ok(Value::Func(Rc::new(Func {
+                params: params.iter().map(|(n, _)| n.clone()).collect(),
                 body: Rc::new(body.clone()),
                 env: Rc::clone(env),
             }))),

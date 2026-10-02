@@ -30,14 +30,45 @@ print(total, #a)
 1. **Lua front-end** — lexer, parser, interpreter; `lua5.4` as the
    semantics oracle. **Done.**
 2. **Memory + types** — `-- @own`/`-- @ref` arenas with enforced
-   moves, borrows, and ownership inference. **Done.** Luau-style type
-   checking is next.
+   moves, borrows, and ownership inference, plus Luau-style type
+   checking (`linlua check`). **Done.**
 3. **WASM backend** — the strict dialect in linear memory,
    checksum-gated against the interpreter and `lua5.4`.
 4. **QBE** — the strict dialect IR compiled to native assembly via
    [QBE](https://c9x.me/compile/); the wasm module and the native
    binary are two thin backends over one IR.
 5. **Python kernels** — a third front-end on the same engine.
+
+## The type layer
+
+Luau-style annotations, checked statically, erased at runtime:
+
+```lua
+local count: number = 0
+local names: {string} = {"a", "b"}
+local xs: {{number}} = {{1}, {2}}
+
+local function total(xs: {number}): number
+  local sum = 0
+  for i = 1, #xs do
+    sum = sum + xs[i]
+  end
+  return sum
+end
+```
+
+- The type language: `nil`, `number`, `string`, `boolean`, `any`,
+  and `{T}` arrays. Unannotated code is inferred where the
+  initializer is obvious and treated as `any` elsewhere — `any` is
+  compatible with everything, so plain Lua never errors.
+- `linlua check file.lua` renders the diagnostics and exits 1 on
+  anything wrong.
+- Types never change what a program does; the test suite pins
+  erasure (typed and untyped forms run identically).
+- One honest trade: annotated syntax is Luau-flavored, so annotated
+  programs are outside the `lua5.4` differential's scope (real Lua
+  cannot parse `:` annotations). The dynamic core keeps full
+  differential coverage; the checker and erasure tests pin the rest.
 
 ## The memory layer
 

@@ -7,6 +7,7 @@
 //! `lua5.4`.
 
 pub mod ast;
+pub mod check;
 pub mod infer;
 pub mod interp;
 pub mod lexer;
@@ -14,7 +15,7 @@ pub mod mem;
 pub mod parser;
 pub mod value;
 
-pub use ast::{BinOp, Chunk, Expr, Stmt, Target, UnOp};
+pub use ast::{BinOp, Chunk, Expr, Stmt, Target, TypeAnn, UnOp};
 pub use interp::{Interp, InterpError};
 pub use lexer::{LexError, NumLit};
 pub use parser::{parse_chunk, ParseError};
@@ -27,6 +28,16 @@ pub fn run(source: &str, out: &mut dyn std::io::Write) -> Result<(), InterpError
         message: format!("parse error: {}", e.message),
     })?;
     Interp::new(out).run(&chunk)
+}
+
+/// Typechecks `source` statically and returns every type error.
+///
+/// Annotations are Luau-flavored: checked here, erased at runtime.
+/// Unannotated code is inferred where the initializer is obvious and
+/// treated as `any` elsewhere; `any` is compatible with everything.
+pub fn check_program(source: &str) -> Result<Vec<check::TypeError>, String> {
+    let chunk = parse_chunk(source).map_err(|e| e.message)?;
+    Ok(check::check_program(&chunk))
 }
 
 /// Parses, infers ownership, and runs. Declarations that provably

@@ -42,8 +42,9 @@ fn process_body(stmts: &mut [Stmt]) -> Inference {
         } = stmt
         {
             if names.len() == 1 && inits.len() == 1 && is_sequence_literal(&inits[0]) {
-                candidates.retain(|(n, _)| n != &names[0]);
-                candidates.push((names[0].clone(), i));
+                let (name0, _) = &names[0];
+                candidates.retain(|(n, _)| n != name0);
+                candidates.push((name0.clone(), i));
             }
         }
     }
@@ -127,7 +128,7 @@ fn stmt_disqualifies(stmt: &Stmt, name: &str) -> bool {
             ann: _,
         } => {
             // Re-shadowing the name disqualifies (conservative).
-            if names.iter().any(|n| n == name) {
+            if names.iter().any(|(n, _)| n == name) {
                 return true;
             }
             inits
@@ -157,11 +158,12 @@ fn stmt_disqualifies(stmt: &Stmt, name: &str) -> bool {
         Stmt::Fn {
             name: fname,
             params,
+            ret: _,
             body,
             is_local: _,
         } => {
             fname == name
-                || params.iter().any(|p| p == name)
+                || params.iter().any(|(p, _)| p == name)
                 || body.iter().any(|s| occurs_at_all(s, name))
         }
         Stmt::Expr(e) => expr_bare_use(e, name, false) || expr_captures(e, name),
@@ -277,9 +279,11 @@ fn expr_occurs(e: &Expr, name: &str) -> bool {
 /// Any occurrence inside a nested function body is a capture.
 fn expr_captures(e: &Expr, name: &str) -> bool {
     match e {
-        Expr::Function { params, body } => {
-            params.iter().any(|p| p == name) || body.iter().any(|s| occurs_at_all(s, name))
-        }
+        Expr::Function {
+            params,
+            ret: _,
+            body,
+        } => params.iter().any(|(p, _)| p == name) || body.iter().any(|s| occurs_at_all(s, name)),
         Expr::Paren(inner) => expr_captures(inner, name),
         Expr::Unary(_, inner) => expr_captures(inner, name),
         Expr::Binary(_, l, r) => expr_captures(l, name) || expr_captures(r, name),
@@ -315,7 +319,7 @@ fn scan_stmt(stmt: &Stmt, name: &str, found: &mut bool) {
             inits,
             ann: _,
         } => {
-            if names.iter().any(|n| n == name) {
+            if names.iter().any(|(n, _)| n == name) {
                 *found = true;
                 return;
             }
@@ -345,7 +349,7 @@ fn scan_stmt(stmt: &Stmt, name: &str, found: &mut bool) {
             body,
             ..
         } => {
-            if n == name || params.iter().any(|p| p == name) {
+            if n == name || params.iter().any(|(p, _)| p == name) {
                 *found = true;
                 return;
             }
@@ -454,8 +458,12 @@ fn scan_expr(e: &Expr, name: &str, found: &mut bool) {
                 }
             }
         }
-        Expr::Function { params, body } => {
-            if params.iter().any(|p| p == name) {
+        Expr::Function {
+            params,
+            ret: _,
+            body,
+        } => {
+            if params.iter().any(|(p, _)| p == name) {
                 *found = true;
                 return;
             }
