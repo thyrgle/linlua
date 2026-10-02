@@ -8,3 +8,5 @@ repository = "https://github.com/thyrgle/linlua"
 readme = "README.md"
 
 [dependencies]
+wasm-encoder = "0.260.0"
+wasmparser = "0.260.0"

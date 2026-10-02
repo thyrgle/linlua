@@ -33,11 +33,31 @@ print(total, #a)
    moves, borrows, and ownership inference, plus Luau-style type
    checking (`linlua check`). **Done.**
 3. **WASM backend** — the strict dialect in linear memory,
-   checksum-gated against the interpreter and `lua5.4`.
+   checksum-gated against the interpreter and `lua5.4`. **Done.**
 4. **QBE** — the strict dialect IR compiled to native assembly via
    [QBE](https://c9x.me/compile/); the wasm module and the native
-   binary are two thin backends over one IR.
+   binary are two thin backends over one IR. **Next.**
 5. **Python kernels** — a third front-end on the same engine.
+
+## The WASM strict dialect
+
+`linlua::compile_to_wasm` compiles a kernel-shaped subset to a real
+module: numbers keep Lua's integer/float subtyping (i64/f64 with the
+interpreter's arithmetic propagation), sequences live in linear
+memory (length header + 1-based elements), and `print` arrives
+through typed host imports — `logi` for integers, `logf` for floats,
+with the host formatting floats as `%.14g`, ties rounded half-to-even,
+matching C and Lua exactly.
+
+Not in the dialect (rejected at compile time): closures, first-class
+functions, varargs, `for..in`, globals as variables, string
+concatenation, keyed tables, nil. Sequences have a fixed length —
+stores beyond it trap (the one documented divergence from Lua's
+growing tables).
+
+The proof: every fixture runs on the interpreter AND as a compiled
+module in Node — byte-identical — and the unannotated core runs
+against a real `lua5.4` too. Three engines, one checksum.
 
 ## The type layer
 
