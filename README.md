@@ -36,8 +36,39 @@ print(total, #a)
    checksum-gated against the interpreter and `lua5.4`. **Done.**
 4. **QBE** — the strict dialect IR compiled to native assembly via
    [QBE](https://c9x.me/compile/); the wasm module and the native
-   binary are two thin backends over one IR. **Next.**
+   binary are two thin backends over one IR. **Done** — the compiled
+   WASM module lowers to QBE IL, assembles, and links against a small
+   C runtime: fib(30) runs ~130× faster than the interpreter.
 5. **Python kernels** — a third front-end on the same engine.
+
+## Native via QBE
+
+The compiled module IS the portable IR. `qbe::wasm_to_qbe` lowers it
+to [QBE](https://c9x.me/compile/) IL; `qbe` assembles; `cc` links
+against ~30 lines of C runtime. One program, two engines:
+
+```sh
+cargo run --release --example qbedbg   # or: linlua::run_native(src)
+```
+
+```text
+compile+cc: 102ms
+native fib(30) x5: 55ms total      (~11ms per run)
+interp fib(30) x5: 7.13s total     (~1.43s per run)
+```
+
+Lowering rules worth knowing: every wasm i32 promotes to QBE `l`
+(addresses/lengths are small positives, so 32-bit wraparound never
+matters); comparison results stay word-sized; memarg offsets become
+explicit address adds; structured control flow becomes labeled blocks
+with jumps; `if`-with-result assigns one temporary in both arms and
+lets QBE's SSA construction insert the phi; linear memory is a static
+16 MiB image with the data segments baked in and `pow`/`floor` lower
+to libm calls. The C runtime formats floats with `printf("%.14g")` —
+the very same call Lua itself makes, so the ties round identically.
+
+The native output is checksum-gated against the interpreter AND
+`lua5.4` for every fixture, same as the WASM path.
 
 ## The WASM strict dialect
 

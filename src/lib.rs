@@ -13,6 +13,7 @@ pub mod interp;
 pub mod lexer;
 pub mod mem;
 pub mod parser;
+pub mod qbe;
 pub mod value;
 pub mod wasm;
 
@@ -54,6 +55,24 @@ pub fn run_inferred(
     let inference = infer::infer(&mut chunk);
     Interp::new(out).run(&chunk)?;
     Ok(inference)
+}
+
+/// Compiles the strict dialect all the way to a native binary:
+/// linlua -> WASM -> QBE IL -> assembly -> executable, linked against
+/// a small C runtime. Requires the `qbe` and `cc` tools.
+pub fn compile_native(source: &str) -> Result<Vec<u8>, String> {
+    qbe::compile_native(source)
+}
+
+/// Compiles AND runs natively, returning stdout.
+pub fn run_native(source: &str) -> Result<String, String> {
+    qbe::run_native(source)
+}
+
+/// The QBE IL for a program's compiled module (for inspection).
+pub fn qbe_il(source: &str) -> Result<String, String> {
+    let wasm = compile_to_wasm(source).map_err(|e| e.message)?;
+    qbe::wasm_to_qbe(&wasm)
 }
 
 /// Compiles the strict dialect to a WebAssembly module: Lua's
