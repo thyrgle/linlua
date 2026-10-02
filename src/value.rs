@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::ast::Stmt;
+use crate::mem::OwnHandle;
 
 /// A table key: integers (including float keys with an exact integer
 /// value, normalized like Lua) and strings. Other key types are not
@@ -83,6 +84,16 @@ pub enum Value {
     Num(f64),
     Str(Rc<String>),
     Table(Rc<RefCell<Table>>),
+    /// An `-- @own` sequence in the linear-memory arena. Single
+    /// owner: moves invalidate the source, references are read-only,
+    /// and it cannot escape its scope.
+    Own(OwnHandle),
+    /// A read-only view of another value (`-- @ref`). Reads pass
+    /// through; every write through a reference is an error — even
+    /// after the reference is copied.
+    Ref(Box<Value>),
+    /// The tombstone left behind when an owned value moves.
+    Moved,
     Func(Rc<Func>),
 }
 
@@ -141,7 +152,19 @@ impl Value {
             Value::Int(_) | Value::Num(_) => "number",
             Value::Str(_) => "string",
             Value::Table(_) => "table",
+            Value::Own(_) => "table",
+            Value::Ref(inner) => inner.type_name(),
+            Value::Moved => "moved value",
             Value::Func(_) => "function",
+        }
+    }
+
+    /// Peels read-only references; the interpreter works on the
+    /// underlying value after this.
+    pub fn unref(&self) -> &Value {
+        match self {
+            Value::Ref(inner) => inner.unref(),
+            other => other,
         }
     }
 
@@ -159,6 +182,9 @@ impl Value {
                 let p = Rc::as_ptr(t) as *const () as usize;
                 format!("table: 0x{p:08x}")
             }
+            Value::Own(h) => format!("table: 0x{:08x}", h.0),
+            Value::Ref(inner) => inner.tostring(),
+            Value::Moved => "moved value".to_string(),
             Value::Func(f) => {
                 let p = Rc::as_ptr(f) as *const () as usize;
                 format!("function: 0x{p:08x}")
@@ -177,6 +203,14 @@ impl Value {
             (Value::Num(a), Value::Num(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Table(a), Value::Table(b)) => Rc::ptr_eq(a, b),
+            (Value::Own(a), Value::Own(b)) => a == b,
+            (Value::Own(a), Value::Table(b)) | (Value::Table(b), Value::Own(a)) => {
+                // An owned value never equals a GC table.
+                let _ = (a, b);
+                false
+            }
+            (Value::Ref(a), b) => a.lua_eq(b),
+            (a, Value::Ref(b)) => a.lua_eq(b),
             (Value::Func(a), Value::Func(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }

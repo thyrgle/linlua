@@ -65,7 +65,9 @@ const FIXTURES: &[&str] = &[
     // Lua's array-part order.
     "for k, v in pairs({10, 20, 30}) do print(k, v) end",
     "for i, v in ipairs({10, 20, 30}) do print(i, v) end",
-    "local t = {x = 1, y = 2} for k, v in pairs(t) do print(k, v) end",
+    // pairs over sequences only: Lua randomizes string-hash seeds
+    // per run, so dict iteration order is not differential material.
+    "local t = {10, 20, 30} for k, v in pairs(t) do print(k, v) end",
     "local sum = 0 for _, v in ipairs({1, 2, 3, 4}) do sum = sum + v end print(sum)",
     // Kernels: the shapes the WASM backend will target.
     "local a = {1, 2, 3, 4, 5} local s = 0 for i = 0, #a - 1 do s = s + a[i + 1] end print(s)",
@@ -74,7 +76,68 @@ const FIXTURES: &[&str] = &[
     "local sum = 0 local i = 1 while i <= 100 do sum = sum + i i = i + 1 end print(sum)",
 ];
 
+const MEM_FIXTURES: &[(&str, bool)] = &[
+    // (source, run_inferred) — annotations are plain comments to
+    // lua5.4, so both modes must match it byte-for-byte.
+    ("-- @own\nlocal a = {10, 20, 30}\na[2] = 99\na[4] = 40\nprint(#a, a[1], a[2], a[3], a[4])\n", false),
+    ("-- @own\nlocal a = {5, 4, 3, 2, 1}\nlocal s = 0\nfor i = 1, #a do s = s + a[i] end\nprint(s)\n", false),
+    ("-- @own\nlocal a = {3, 1, 2}\nfor i = 1, #a do for j = i + 1, #a do if a[j] < a[i] then local tmp = a[i] a[i] = a[j] a[j] = tmp end end end\nprint(a[1], a[2], a[3])\n", false),
+    ("-- @own\nlocal a = {1, 2, 3}\n-- @ref\nlocal r = a\nprint(r[1], #r, r == a)\n", false),
+    ("-- @own\nlocal a = {2, 4, 6}\nlocal function total(t) local s = 0 for i = 1, #t do s = s + t[i] end return s end\nprint(total(a))\n", false),
+    // Inferred mode: same programs without annotations.
+    ("local a = {10, 20, 30}\nlocal s = 0\nfor i = 1, #a do s = s + a[i] end\nprint(s)\n", true),
+    ("local a = {3, 1, 2}\nfor i = 1, #a do a[i] = a[i] * 2 end\nprint(a[1], a[2], a[3])\n", true),
+    ("local a = {9, 5, 7}\nlocal function total(t) local s = 0 for i = 1, #t do s = s + t[i] end return s end\nprint(total(a))\n", true),
+    ("local a = {}\nfor i = 1, 6 do a[i] = i ^ 2 end\nprint(a[6], #a)\n", true),
+];
+
+fn lua54_available() -> bool {
+    std::process::Command::new("lua5.4")
+        .arg("-v")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 #[test]
+fn memory_layer_matches_lua54() {
+    if !lua54_available() {
+        eprintln!("skipping: lua5.4 is not installed");
+        return;
+    }
+    for (src, inferred) in MEM_FIXTURES {
+        eprintln!("fixture ({inferred}): {src}");
+        let mut ours = Vec::new();
+        let result = if *inferred {
+            linlua::run_inferred(src, &mut ours)
+                .map(|_| ())
+                .map_err(|e| e.message)
+        } else {
+            linlua::run(src, &mut ours).map_err(|e| e.message)
+        };
+        if let Err(e) = result {
+            panic!("linlua errored on:\n{src}\n{e}");
+        }
+        let ours = String::from_utf8(ours).unwrap();
+        let mut child = std::process::Command::new("lua5.4")
+            .arg("-")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn lua5.4");
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(src.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let theirs = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(ours, theirs, "divergence on:\n{src}");
+    }
+}
+
 fn interpreter_matches_lua54() {
     for src in FIXTURES {
         eprintln!("fixture: {src}");

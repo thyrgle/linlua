@@ -4,6 +4,15 @@
 //! are recorded — the memory annotations (`-- @own`, `-- @ref`) are
 //! recovered from these, exactly like linjs.
 
+/// The memory annotations: comments that opt a declaration into the
+/// linear-memory layer. `@own` allocates the table into an arena;
+/// `@ref` binds a read-only view without consuming the owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Annotation {
+    Own,
+    Ref,
+}
+
 /// A token kind. Keyword and punctuation kinds are exact; literals
 /// carry their parsed value.
 #[derive(Debug, Clone, PartialEq)]
@@ -99,6 +108,11 @@ pub struct Lexer<'s> {
     pos: usize,
     /// Spans of comments seen so far, in order.
     pub comments: Vec<(usize, usize)>,
+    /// Memory annotations recovered from comments: `-- @own` /
+    /// `-- @ref`, keyed by the comment's end offset. The parser
+    /// attaches one to a declaration when the comment sits between
+    /// the previous token and the statement.
+    pub annotations: Vec<(usize, Annotation)>,
 }
 
 impl<'s> Lexer<'s> {
@@ -107,12 +121,15 @@ impl<'s> Lexer<'s> {
             src: src.as_bytes(),
             pos: 0,
             comments: Vec::new(),
+            annotations: Vec::new(),
         }
     }
 
     /// Lexes the whole source. Stops at the first error — the parser
-    /// reports it with position and recovers upstream.
-    pub fn tokenize(mut self) -> Result<Vec<Token>, LexError> {
+    /// reports it with position and recovers upstream. After a
+    /// successful call, `annotations` holds the recovered memory
+    /// annotations.
+    pub fn tokenize(&mut self) -> Result<Vec<Token>, LexError> {
         let mut out = Vec::new();
         loop {
             self.skip_trivia()?;
@@ -129,6 +146,27 @@ impl<'s> Lexer<'s> {
         }
     }
 
+    /// The memory annotation carried by the comment at `start`, if
+    /// its body is exactly `@own` or `@ref` (long-bracket wrappers
+    /// stripped).
+    fn comment_annotation(&self, start: usize) -> Option<Annotation> {
+        let body = self.src.get(start + 2..self.pos)?;
+        let text = std::str::from_utf8(body).ok()?;
+        let text = text.trim();
+        let text = if let Some(rest) = text.strip_prefix('[') {
+            let eqs = rest.len() - rest.trim_start_matches('=').len();
+            let open = 1 + eqs;
+            text.get(open..text.len() - open)?
+        } else {
+            text
+        };
+        match text.trim() {
+            "@own" => Some(Annotation::Own),
+            "@ref" => Some(Annotation::Ref),
+            _ => None,
+        }
+    }
+
     fn skip_trivia(&mut self) -> Result<(), LexError> {
         loop {
             match self.src.get(self.pos) {
@@ -141,6 +179,9 @@ impl<'s> Lexer<'s> {
                         if let Some(len) = self.long_bracket_level() {
                             self.skip_long_bracket(len)?;
                             self.comments.push((start, self.pos));
+                            if let Some(a) = self.comment_annotation(start) {
+                                self.annotations.push((self.pos, a));
+                            }
                             continue;
                         }
                     }
@@ -149,6 +190,9 @@ impl<'s> Lexer<'s> {
                         self.pos += 1;
                     }
                     self.comments.push((start, self.pos));
+                    if let Some(a) = self.comment_annotation(start) {
+                        self.annotations.push((self.pos, a));
+                    }
                 }
                 _ => return Ok(()),
             }

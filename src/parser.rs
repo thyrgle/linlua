@@ -8,11 +8,12 @@
 //! in Lua.
 
 use crate::ast::*;
-use crate::lexer::{Tok, Token};
+use crate::lexer::{Annotation, Tok, Token};
 
 pub struct Parser {
     toks: Vec<Token>,
     pos: usize,
+    annotations: Vec<(usize, Annotation)>,
 }
 
 /// A parse error: message plus absolute byte offset.
@@ -23,8 +24,28 @@ pub struct ParseError {
 }
 
 impl Parser {
-    pub fn new(toks: Vec<Token>) -> Self {
-        Parser { toks, pos: 0 }
+    pub fn new(toks: Vec<Token>, annotations: Vec<(usize, Annotation)>) -> Self {
+        Parser {
+            toks,
+            pos: 0,
+            annotations,
+        }
+    }
+
+    /// The annotation attached to the statement starting at
+    /// `stmt_start`: a comment sitting between the previous token and
+    /// the statement. One annotation applies to one statement.
+    fn pending_annotation(&self, stmt_start: usize) -> Option<Annotation> {
+        let prev_end = if self.pos == 0 {
+            0
+        } else {
+            self.toks[self.pos - 1].end
+        };
+        self.annotations
+            .iter()
+            .rev()
+            .find(|(end, _)| *end >= prev_end && *end <= stmt_start)
+            .map(|(_, a)| *a)
     }
 
     pub fn parse_chunk(&mut self) -> Result<Chunk, ParseError> {
@@ -145,6 +166,9 @@ impl Parser {
                 Ok(Stmt::Do(Vec::new()))
             }
             Tok::Local => {
+                // The annotation (if any) sits between the previous
+                // token and this statement — capture before advancing.
+                let ann = self.pending_annotation(self.toks[self.pos].start);
                 self.pos += 1;
                 if self.eat(&Tok::Function) {
                     let name = self.expect_name()?;
@@ -167,7 +191,7 @@ impl Parser {
                         inits.push(self.expr()?);
                     }
                 }
-                Ok(Stmt::Local { names, inits })
+                Ok(Stmt::Local { names, inits, ann })
             }
             Tok::If => self.if_stmt(),
             Tok::While => {
@@ -376,13 +400,13 @@ impl Parser {
 
     fn cmp_expr(&mut self) -> Result<Expr, ParseError> {
         let l = self.bor_expr()?;
-        let op = match &self.toks[self.pos].tok {
-            Tok::Lt => BinOp::Lt,
-            Tok::Gt => BinOp::Gt,
-            Tok::Le => BinOp::Le,
-            Tok::Ge => BinOp::Ge,
-            Tok::NotEq => BinOp::NotEq,
-            Tok::Eq => BinOp::Eq,
+        let op = match self.toks.get(self.pos).map(|t| &t.tok) {
+            Some(Tok::Lt) => BinOp::Lt,
+            Some(Tok::Gt) => BinOp::Gt,
+            Some(Tok::Le) => BinOp::Le,
+            Some(Tok::Ge) => BinOp::Ge,
+            Some(Tok::NotEq) => BinOp::NotEq,
+            Some(Tok::Eq) => BinOp::Eq,
             _ => return Ok(l),
         };
         self.pos += 1;
@@ -468,11 +492,11 @@ impl Parser {
     fn mul_expr(&mut self) -> Result<Expr, ParseError> {
         let mut l = self.unary_expr()?;
         loop {
-            let op = match &self.toks[self.pos].tok {
-                Tok::Star => BinOp::Mul,
-                Tok::Slash => BinOp::Div,
-                Tok::DSlash => BinOp::IDiv,
-                Tok::Percent => BinOp::Mod,
+            let op = match self.toks.get(self.pos).map(|t| &t.tok) {
+                Some(Tok::Star) => BinOp::Mul,
+                Some(Tok::Slash) => BinOp::Div,
+                Some(Tok::DSlash) => BinOp::IDiv,
+                Some(Tok::Percent) => BinOp::Mod,
                 _ => break,
             };
             self.pos += 1;
@@ -483,11 +507,11 @@ impl Parser {
     }
 
     fn unary_expr(&mut self) -> Result<Expr, ParseError> {
-        let op = match &self.toks[self.pos].tok {
-            Tok::Not => UnOp::Not,
-            Tok::Minus => UnOp::Neg,
-            Tok::Hash => UnOp::Len,
-            Tok::Tilde => UnOp::BNot,
+        let op = match self.toks.get(self.pos).map(|t| &t.tok) {
+            Some(Tok::Not) => UnOp::Not,
+            Some(Tok::Minus) => UnOp::Neg,
+            Some(Tok::Hash) => UnOp::Len,
+            Some(Tok::Tilde) => UnOp::BNot,
             _ => return self.pow_expr(),
         };
         self.pos += 1;
@@ -628,13 +652,18 @@ fn expr_to_target(e: Expr, offset: usize) -> Result<Target, ParseError> {
     }
 }
 
-/// Parses a whole chunk or returns the first fatal error.
+/// Parses a whole chunk or returns the first fatal error. Memory
+/// annotations (`-- @own` / `-- @ref`) are recovered from comments and
+/// attached to the declarations they precede.
 pub fn parse_chunk(source: &str) -> Result<Chunk, ParseError> {
-    let tokens = crate::lexer::Lexer::new(source)
-        .tokenize()
-        .map_err(|e| ParseError {
-            offset: e.offset,
-            message: e.message,
-        })?;
-    Parser::new(tokens).parse_chunk()
+    let mut lexer = crate::lexer::Lexer::new(source);
+    let tokens = lexer.tokenize().map_err(|e| ParseError {
+        offset: e.offset,
+        message: e.message,
+    })?;
+    let annotations = std::mem::take(&mut lexer.annotations);
+    if std::env::var("ANNDBG").is_ok() {
+        eprintln!("annotations: {:?}", annotations);
+    }
+    Parser::new(tokens, annotations).parse_chunk()
 }

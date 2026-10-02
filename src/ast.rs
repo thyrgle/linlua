@@ -3,7 +3,7 @@
 //! Statements end at block boundaries (no semicolons needed); the
 //! parser tolerates them.
 
-use crate::lexer::NumLit;
+use crate::lexer::{Annotation, NumLit};
 
 /// A parsed source file: top-level statements (a chunk).
 pub type Chunk = Vec<Stmt>;
@@ -11,11 +11,14 @@ pub type Chunk = Vec<Stmt>;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     /// `local a, b = e1, e2` — values pair positionally; missing
-    /// initializers are nil, extras drop. No types yet (M3 adds
+    /// initializers are nil, extras drop. An annotation (`-- @own` /
+    /// `-- @ref` on the preceding comment line) opts the single-name
+    /// form into the linear-memory layer. No types yet (M3 adds
     /// Luau-style annotations).
     Local {
         names: Vec<String>,
         inits: Vec<Expr>,
+        ann: Option<Annotation>,
     },
     /// `name = expr` (globals and existing locals; fields and indices
     /// are in [Expr::Assign]-style suffix form).

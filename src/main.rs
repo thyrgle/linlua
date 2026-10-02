@@ -6,13 +6,16 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.split_first() {
-        Some((cmd, rest)) if cmd == "run" => match rest.first() {
-            Some(path) => run_file(path),
-            _ => {
-                eprintln!("usage: linlua run <file.lua>");
-                ExitCode::from(2)
+        Some((cmd, rest)) if cmd == "run" => {
+            let no_infer = rest.iter().any(|a| a == "--no-infer");
+            match rest.iter().find(|a| !a.starts_with('-')) {
+                Some(path) => run_file(path, no_infer),
+                _ => {
+                    eprintln!("usage: linlua run [--no-infer] <file.lua>");
+                    ExitCode::from(2)
+                }
             }
-        },
+        }
         Some((cmd, _)) => {
             eprintln!("unknown command `{cmd}` (v1 knows `run`)");
             ExitCode::from(2)
@@ -30,7 +33,7 @@ USAGE:
     }
 }
 
-fn run_file(path: &str) -> ExitCode {
+fn run_file(path: &str, no_infer: bool) -> ExitCode {
     let source = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -40,7 +43,15 @@ fn run_file(path: &str) -> ExitCode {
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    match linlua::run(&source, &mut lock) {
+    // Inference is output-invisible (the differential suite pins
+    // this), so `run` infers by default; --no-infer keeps
+    // annotations-only semantics for debugging the inferrer.
+    let result = if no_infer {
+        linlua::run(&source, &mut lock)
+    } else {
+        linlua::run_inferred(&source, &mut lock).map(|_| ())
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let _ = writeln!(lock);

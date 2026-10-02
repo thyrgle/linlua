@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ast::*;
+use crate::lexer::Annotation;
+use crate::mem::{Arenas, OwnHandle};
 use crate::value::{Func, Key, Table, Value};
 
 /// A runtime error, Lua-flavored.
@@ -65,6 +67,8 @@ pub struct Interp<'o> {
     out: &'o mut dyn std::io::Write,
     /// Globals: plain assignment to an undeclared name.
     globals: Rc<RefCell<Table>>,
+    /// Linear memory for `-- @own` tables.
+    arenas: Rc<RefCell<Arenas>>,
 }
 
 /// Control flow out of a statement.
@@ -89,7 +93,12 @@ impl<'o> Interp<'o> {
         Interp {
             out,
             globals: Rc::new(RefCell::new(globals)),
+            arenas: Rc::new(RefCell::new(Arenas::default())),
         }
+    }
+
+    pub fn arenas(&self) -> Rc<RefCell<Arenas>> {
+        Rc::clone(&self.arenas)
     }
 
     pub fn run(&mut self, chunk: &[Stmt]) -> R<()> {
@@ -117,11 +126,51 @@ impl<'o> Interp<'o> {
 
     fn exec_stmt(&mut self, stmt: &Stmt, env: &Rc<RefCell<Env>>) -> R<Flow> {
         match stmt {
-            Stmt::Local { names, inits } => {
+            Stmt::Local { names, inits, ann } => {
+                // An annotation opts the single-name form into linear
+                // memory; multi-name declarations stay dynamic.
+                if ann.is_some() && names.len() != 1 {
+                    return Err(bail("annotate one name at a time"));
+                }
+                match ann {
+                    Some(Annotation::Own) => {
+                        let name = &names[0];
+                        let handle = self.alloc_own(&inits[0], env)?;
+                        env.borrow_mut()
+                            .vars
+                            .insert(name.clone(), Value::Own(handle));
+                        return Ok(Flow::Normal);
+                    }
+                    Some(Annotation::Ref) => {
+                        let name = &names[0];
+                        let v = self.eval(&inits[0], env)?;
+                        env.borrow_mut()
+                            .vars
+                            .insert(name.clone(), Value::Ref(Box::new(v)));
+                        return Ok(Flow::Normal);
+                    }
+                    None => {}
+                }
                 let values: Vec<Value> = inits
                     .iter()
                     .map(|e| self.eval(e, env))
                     .collect::<R<Vec<_>>>()?;
+                // Aliasing an owned value is a move: the source
+                // becomes a tombstone (before any binding borrows).
+                let values: Vec<Value> = values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, v)| match (&v, inits.get(i)) {
+                        (Value::Own(_), Some(Expr::Ident(src))) => {
+                            let src = src.clone();
+                            if names.get(i).map(|n| n == &src) != Some(true) {
+                                env.borrow_mut().assign(&src, Value::Moved);
+                            }
+                            v
+                        }
+                        _ => v,
+                    })
+                    .collect();
                 let mut scope = env.borrow_mut();
                 for (i, name) in names.iter().enumerate() {
                     let v = values.get(i).cloned().unwrap_or(Value::Nil);
@@ -130,8 +179,15 @@ impl<'o> Interp<'o> {
                 Ok(Flow::Normal)
             }
             Stmt::Assign { target, value } => {
-                let value = self.eval(value, env)?;
-                self.assign(target, value, env)?;
+                let v = self.eval(value, env)?;
+                // Aliasing an owned value is a move: the source
+                // becomes a tombstone.
+                if let (Value::Own(_), Expr::Ident(src)) = (&v, value) {
+                    if matches!(target, Target::Name(dst) if dst != src) {
+                        env.borrow_mut().assign(src, Value::Moved);
+                    }
+                }
+                self.assign(target, v, env)?;
                 Ok(Flow::Normal)
             }
             Stmt::Fn {
@@ -274,6 +330,7 @@ impl<'o> Interp<'o> {
                         }
                         let t = match self.eval(&args[0], env)? {
                             Value::Table(t) => t,
+                            Value::Own(h) => self.materialize(h),
                             other => {
                                 return Err(bail(format!(
                                     "attempt to iterate over a {} value",
@@ -283,18 +340,16 @@ impl<'o> Interp<'o> {
                         };
                         (t, fn_name == "ipairs")
                     }
-                    _ => {
-                        let t = match self.eval(expr, env)? {
-                            Value::Table(t) => t,
-                            other => {
-                                return Err(bail(format!(
-                                    "attempt to iterate over a {} value",
-                                    other.type_name()
-                                )))
-                            }
-                        };
-                        (t, false)
-                    }
+                    _ => match self.eval(expr, env)? {
+                        Value::Table(t) => (t, false),
+                        Value::Own(h) => (self.materialize(h), false),
+                        other => {
+                            return Err(bail(format!(
+                                "attempt to iterate over a {} value",
+                                other.type_name()
+                            )))
+                        }
+                    },
                 };
                 let entries: Vec<(Key, Value)> = t.borrow().entries.clone();
                 let entries: Vec<(Key, Value)> = if ipairs_only {
@@ -336,6 +391,11 @@ impl<'o> Interp<'o> {
                     Some(e) => self.eval(e, env)?,
                     None => Value::Nil,
                 };
+                // Ownership cannot escape: an owned value returned
+                // from its scope has no owner left behind.
+                if matches!(value, Value::Own(_)) {
+                    return Err(bail("an @own value cannot escape via return"));
+                }
                 Ok(Flow::Return(value))
             }
             Stmt::Break => Ok(Flow::Break),
@@ -380,16 +440,60 @@ impl<'o> Interp<'o> {
     }
 
     fn table_set(&mut self, obj: Value, key: &Key, value: Value) -> R<()> {
-        match obj {
+        // Writes through a borrowed reference fail loudly — before
+        // the reference is peeled.
+        if matches!(obj, Value::Ref(_)) {
+            return Err(bail("attempt to write through a borrowed reference"));
+        }
+        // Storing an owned value anywhere is an ownership violation:
+        // GC containers would hide the owner, owned containers would
+        // nest ownership (depth-one).
+        if let Value::Own(_) = value {
+            return Err(bail(
+                "an @own value cannot be stored in a container (it must stay bound to its name)",
+            ));
+        }
+        match obj.unref() {
             Value::Table(t) => {
                 t.borrow_mut().set(key.clone(), value);
                 Ok(())
             }
+            Value::Own(h) => match key {
+                Key::Int(i) => self.arenas.borrow_mut().set(*h, *i, value).map_err(bail),
+                Key::Str(k) => Err(bail(format!("an @own table is a sequence (no key `{k}`)"))),
+            },
             other => Err(bail(format!(
                 "attempt to index a {} value",
                 other.type_name()
             ))),
         }
+    }
+
+    /// Allocates a table literal into the arena (`-- @own`): the
+    /// initializer must be a pure sequence of items.
+    fn alloc_own(&mut self, init: &Expr, env: &Rc<RefCell<Env>>) -> R<OwnHandle> {
+        let fields = match init {
+            Expr::Table(fields) => fields,
+            _ => return Err(bail("-- @own requires a table literal initializer")),
+        };
+        let mut items = Vec::new();
+        for f in fields {
+            match f {
+                TableField::Item(e) => {
+                    let v = self.eval(e, env)?;
+                    if let Value::Own(_) = v {
+                        return Err(bail("an @own value cannot nest in another @own value"));
+                    }
+                    items.push(v);
+                }
+                TableField::Keyed { .. } => {
+                    return Err(bail(
+                        "an @own table must be a pure sequence (no keyed fields)",
+                    ));
+                }
+            }
+        }
+        Ok(self.arenas.borrow_mut().alloc(items))
     }
 
     // ---- expressions ----
@@ -407,6 +511,9 @@ impl<'o> Interp<'o> {
             Expr::Vararg => Err(bail("varargs are not in the v1 dialect")),
             Expr::Ident(name) => {
                 if let Some(v) = env.borrow().get(name) {
+                    if matches!(v, Value::Moved) {
+                        return Err(bail(format!("use of a moved value (`{name}`)")));
+                    }
                     return Ok(v);
                 }
                 Ok(self.globals.borrow().get(&Key::Str(name.clone())))
@@ -480,6 +587,7 @@ impl<'o> Interp<'o> {
                 let o = self.eval(obj, env)?;
                 self.index(o, &Key::Str(name.clone()))
             }
+            // (Own/Ref handling lives in `index`.)
             Expr::Call { callee, args } => {
                 // Builtins dispatch by name.
                 if let Expr::Ident(n) = &**callee {
@@ -494,7 +602,14 @@ impl<'o> Interp<'o> {
                 let f = self.eval(callee, env)?;
                 let mut vals = Vec::new();
                 for a in args {
-                    vals.push(self.eval(a, env)?);
+                    let v = self.eval(a, env)?;
+                    // Passing an owned value borrows it: the callee
+                    // reads through a reference, and any write through
+                    // that reference fails loudly.
+                    vals.push(match v {
+                        Value::Own(_) => Value::Ref(Box::new(v)),
+                        other => other,
+                    });
                 }
                 self.call(f, vals)
             }
@@ -546,9 +661,24 @@ impl<'o> Interp<'o> {
         }
     }
 
+    /// Copies an owned sequence into a fresh insertion-ordered table
+    /// for iteration (1-based keys, arena order).
+    fn materialize(&mut self, h: OwnHandle) -> Rc<RefCell<Table>> {
+        let items = self.arenas.borrow().items(h);
+        let t = Rc::new(RefCell::new(Table::new()));
+        for (i, v) in items.into_iter().enumerate() {
+            t.borrow_mut().set(Key::Int(i as i64 + 1), v);
+        }
+        t
+    }
+
     fn index(&mut self, obj: Value, key: &Key) -> R<Value> {
-        match obj {
+        match obj.unref() {
             Value::Table(t) => Ok(t.borrow().get(key)),
+            Value::Own(h) => match key {
+                Key::Int(i) => Ok(self.arenas.borrow().get(*h, *i)),
+                Key::Str(k) => Err(bail(format!("an @own table is a sequence (no key `{k}`)"))),
+            },
             other => Err(bail(format!(
                 "attempt to index a {} value",
                 other.type_name()
@@ -591,9 +721,10 @@ impl<'o> Interp<'o> {
                     other.type_name()
                 ))),
             },
-            UnOp::Len => match v {
+            UnOp::Len => match v.unref() {
                 Value::Str(s) => Ok(Value::Int(s.len() as i64)),
                 Value::Table(t) => Ok(Value::Int(t.borrow().border())),
+                Value::Own(h) => Ok(Value::Int(self.arenas.borrow().len(*h) as i64)),
                 other => Err(bail(format!(
                     "attempt to get length of a {} value",
                     other.type_name()
@@ -635,12 +766,14 @@ impl<'o> Interp<'o> {
     }
 
     fn tostring_op(&self, v: &Value) -> R<String> {
-        match v {
-            Value::Nil | Value::Bool(_) | Value::Table(_) | Value::Func(_) => Err(bail(format!(
-                "attempt to concatenate a {} value",
-                v.type_name()
-            ))),
+        match v.unref() {
+            Value::Nil | Value::Bool(_) | Value::Table(_) | Value::Func(_) | Value::Own(_) => Err(
+                bail(format!("attempt to concatenate a {} value", v.type_name())),
+            ),
             Value::Int(_) | Value::Num(_) | Value::Str(_) => Ok(v.tostring()),
+            Value::Moved => Err(bail("attempt to concatenate a moved value")),
+            // unref() already peeled references.
+            Value::Ref(_) => unreachable!(),
         }
     }
 

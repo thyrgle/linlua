@@ -7,8 +7,10 @@
 //! `lua5.4`.
 
 pub mod ast;
+pub mod infer;
 pub mod interp;
 pub mod lexer;
+pub mod mem;
 pub mod parser;
 pub mod value;
 
@@ -25,6 +27,21 @@ pub fn run(source: &str, out: &mut dyn std::io::Write) -> Result<(), InterpError
         message: format!("parse error: {}", e.message),
     })?;
     Interp::new(out).run(&chunk)
+}
+
+/// Parses, infers ownership, and runs. Declarations that provably
+/// never escape allocate into the arena — output-identical to
+/// [`run`] by construction, which the differential suite pins.
+pub fn run_inferred(
+    source: &str,
+    out: &mut dyn std::io::Write,
+) -> Result<infer::Inference, InterpError> {
+    let mut chunk = parse_chunk(source).map_err(|e| InterpError {
+        message: format!("parse error: {}", e.message),
+    })?;
+    let inference = infer::infer(&mut chunk);
+    Interp::new(out).run(&chunk)?;
+    Ok(inference)
 }
 
 /// Runs `source` on this interpreter and on a real `lua5.4`, then

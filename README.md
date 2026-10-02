@@ -28,15 +28,44 @@ print(total, #a)
 ## Roadmap
 
 1. **Lua front-end** — lexer, parser, interpreter; `lua5.4` as the
-   semantics oracle.
-2. **Memory + types** — `-- @own`/`-- @ref` arenas and Luau-style type
-   checking, both erased at runtime.
+   semantics oracle. **Done.**
+2. **Memory + types** — `-- @own`/`-- @ref` arenas with enforced
+   moves, borrows, and ownership inference. **Done.** Luau-style type
+   checking is next.
 3. **WASM backend** — the strict dialect in linear memory,
    checksum-gated against the interpreter and `lua5.4`.
 4. **QBE** — the strict dialect IR compiled to native assembly via
    [QBE](https://c9x.me/compile/); the wasm module and the native
    binary are two thin backends over one IR.
 5. **Python kernels** — a third front-end on the same engine.
+
+## The memory layer
+
+A comment opts a declaration into linear memory:
+
+```lua
+-- @own
+local a = {10, 20, 30}   -- an arena-owned sequence
+-- @ref
+local r = a              -- a read-only view; the owner stays bound
+```
+
+The rules, enforced at runtime:
+
+- **Moves**: aliasing an owned value (`local b = a`) moves it — the
+  source becomes a tombstone, and using it is an error.
+- **Borrows**: every write through a `-- @ref` fails, even after the
+  reference is copied; calls borrow their owned arguments, so a callee
+  that writes through its parameter fails loudly.
+- **Escapes**: an owned value cannot be returned, stored in a
+  container, or nested inside another owned value.
+- **Inference**: unannotated sequence tables that provably never
+  escape allocate into the arena anyway — `linlua run` infers by
+  default (`--no-infer` to disable). Inference is output-invisible,
+  and the differential suite pins that against `lua5.4`. One
+  documented limit: programs that print table *addresses* are outside
+  the contract (GC and arena storage use different, equally arbitrary
+  address formats).
 
 ## Running it
 
